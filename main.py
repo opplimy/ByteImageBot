@@ -1,8 +1,16 @@
 import os
 import base64
+import sqlite3
+from datetime import datetime, timezone
+
 import httpx
 
-from telegram import Update, ReplyKeyboardMarkup
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -11,60 +19,358 @@ from telegram.ext import (
     filters,
 )
 
+# =========================================================
+# CONFIG
+# =========================================================
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID")
-CF_API_TOKEN = os.getenv("CF_API_TOKEN")
+ENV_CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID")
+ENV_CF_API_TOKEN = os.getenv("CF_API_TOKEN")
+
+ADMIN_ID = 8394607974
+CHANNEL_USERNAME = "@ByteTunnel"
+CHANNEL_URL = "https://t.me/ByteTunnel"
 
 TEXT_TO_IMAGE_MODEL = "@cf/black-forest-labs/flux-1-schnell"
 IMAGE_TO_IMAGE_MODEL = "@cf/runwayml/stable-diffusion-v1-5-img2img"
 
+DB_FILE = "byteimage.db"
 
-# =========================
-# Keyboard
-# =========================
 
-def main_keyboard():
+# =========================================================
+# DATABASE
+# =========================================================
+
+def db():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = db()
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            blocked INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL,
+            last_seen TEXT NOT NULL
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            username TEXT,
+            first_name TEXT,
+            prompt TEXT NOT NULL,
+            request_type TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def now_text():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def register_user(user):
+    if not user:
+        return
+
+    now = now_text()
+
+    conn = db()
+
+    conn.execute("""
+        INSERT INTO users (
+            user_id,
+            username,
+            first_name,
+            created_at,
+            last_seen
+        )
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(user_id)
+        DO UPDATE SET
+            username = excluded.username,
+            first_name = excluded.first_name,
+            last_seen = excluded.last_seen
+    """, (
+        user.id,
+        user.username or "",
+        user.first_name or "",
+        now,
+        now,
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+def is_blocked(user_id):
+    conn = db()
+
+    row = conn.execute(
+        "SELECT blocked FROM users WHERE user_id = ?",
+        (user_id,)
+    ).fetchone()
+
+    conn.close()
+
+    return bool(row and row["blocked"])
+
+
+def add_request(user, prompt, request_type):
+    conn = db()
+
+    conn.execute("""
+        INSERT INTO requests (
+            user_id,
+            username,
+            first_name,
+            prompt,
+            request_type,
+            created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (
+        user.id,
+        user.username or "",
+        user.first_name or "",
+        prompt,
+        request_type,
+        now_text(),
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+def get_setting(key, default=None):
+    conn = db()
+
+    row = conn.execute(
+        "SELECT value FROM settings WHERE key = ?",
+        (key,)
+    ).fetchone()
+
+    conn.close()
+
+    if row:
+        return row["value"]
+
+    return default
+
+
+def set_setting(key, value):
+    conn = db()
+
+    conn.execute("""
+        INSERT INTO settings(key, value)
+        VALUES (?, ?)
+        ON CONFLICT(key)
+        DO UPDATE SET value = excluded.value
+    """, (key, value))
+
+    conn.commit()
+    conn.close()
+
+
+def get_cf_account_id():
+    return get_setting("CF_ACCOUNT_ID") or ENV_CF_ACCOUNT_ID
+
+
+def get_cf_api_token():
+    return get_setting("CF_API_TOKEN") or ENV_CF_API_TOKEN
+
+
+# =========================================================
+# KEYBOARDS
+# =========================================================
+
+def main_keyboard(user_id=None):
+    rows = [
+        ["🎨 ساخت تصویر", "🧠 تبدیل پرامپت به عکس"],
+        ["🔄 ساخت تصویر جدید"],
+    ]
+
+    if user_id == ADMIN_ID:
+        rows.append(["👑 پنل مدیریت"])
+
+    return ReplyKeyboardMarkup(
+        rows,
+        resize_keyboard=True
+    )
+
+
+def admin_keyboard():
     return ReplyKeyboardMarkup(
         [
-            ["🎨 ساخت تصویر", "🧠 تبدیل پرامپت به عکس"],
+            ["👥 کاربران", "📜 آخرین درخواست‌ها"],
+            ["🔎 جستجوی کاربر", "📊 آمار کلی"],
+            ["📈 مصرف امروز", "🚫 مدیریت کاربران"],
+            ["⚙️ مدیریت API"],
+            ["🔙 بازگشت"],
         ],
         resize_keyboard=True
     )
 
 
-def image_result_keyboard():
+def join_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "📢 عضویت در کانال",
+                url=CHANNEL_URL
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "✅ بررسی عضویت",
+                callback_data="check_join"
+            )
+        ]
+    ])
+
+
+def result_keyboard():
     return ReplyKeyboardMarkup(
         [
             ["🔄 دوباره بساز", "🎨 ساخت تصویر جدید"],
+            ["🧠 تبدیل پرامپت به عکس"],
         ],
         resize_keyboard=True
     )
 
 
-# =========================
-# Helpers
-# =========================
+# =========================================================
+# FORCE JOIN
+# =========================================================
 
-def contains_persian(text: str) -> bool:
+async def check_membership(user_id, bot):
+    try:
+        member = await bot.get_chat_member(
+            CHANNEL_USERNAME,
+            user_id
+        )
+
+        return member.status in (
+            "member",
+            "administrator",
+            "creator"
+        )
+
+    except Exception as e:
+        print("JOIN CHECK ERROR:", repr(e))
+        return False
+
+
+async def require_join(update, context):
+    user = update.effective_user
+
+    if not user:
+        return False
+
+    if user.id == ADMIN_ID:
+        return True
+
+    if is_blocked(user.id):
+        if update.effective_message:
+            await update.effective_message.reply_text(
+                "🚫 دسترسی شما به این بات مسدود شده است."
+            )
+        return False
+
+    ok = await check_membership(
+        user.id,
+        context.bot
+    )
+
+    if ok:
+        return True
+
+    if update.effective_message:
+        await update.effective_message.reply_text(
+            "📢 برای استفاده از ByteImage ابتدا باید عضو کانال ما شوی.\n\n"
+            "بعد از عضویت روی «✅ بررسی عضویت» بزن.",
+            reply_markup=join_keyboard()
+        )
+
+    return False
+
+
+# =========================================================
+# HELPERS
+# =========================================================
+
+def contains_persian(text):
     return any(
         "\u0600" <= char <= "\u06ff"
         for char in text
     )
 
 
-def cloudflare_url(model: str) -> str:
+def cloudflare_url(model):
+    account_id = get_cf_account_id()
+
     return (
-        f"https://api.cloudflare.com/client/v4/"
-        f"accounts/{CF_ACCOUNT_ID}/ai/run/{model}"
+        "https://api.cloudflare.com/client/v4/"
+        f"accounts/{account_id}/ai/run/{model}"
     )
 
 
-# =========================
-# Start
-# =========================
+def decode_image_result(result):
+    output = result.get("result")
+
+    if isinstance(output, dict):
+        image = output.get("image")
+
+        if isinstance(image, str):
+            return base64.b64decode(image)
+
+        if isinstance(image, list):
+            return bytes(image)
+
+    if isinstance(output, str):
+        try:
+            return base64.b64decode(output)
+        except Exception:
+            pass
+
+    if isinstance(output, list):
+        return bytes(output)
+
+    raise Exception("Cloudflare returned an invalid image response")
+
+
+# =========================================================
+# START
+# =========================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+
+    register_user(user)
+
     context.user_data.clear()
+
+    if not await require_join(update, context):
+        return
 
     await update.message.reply_text(
         "🎨 به ByteImage خوش آمدی!\n\n"
@@ -77,20 +383,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "A black sports car driving on a rainy city street at night, "
         "neon lights, cinematic, realistic\n\n"
         "⏳ بعد از ارسال توضیحت، چند لحظه صبر کن تا تصویر ساخته شود.\n\n"
-        "👇 برای شروع، از منوی پایین گزینه موردنظر را انتخاب کن.",
-        reply_markup=main_keyboard()
+        "👇 برای شروع یکی از گزینه‌های پایین را انتخاب کن.",
+        reply_markup=main_keyboard(user.id)
     )
 
 
-# =========================
-# Text To Image
-# =========================
+# =========================================================
+# TEXT TO IMAGE
+# =========================================================
 
-async def create_image(prompt: str) -> bytes:
+async def create_image(prompt):
+    account_id = get_cf_account_id()
+    api_token = get_cf_api_token()
+
+    if not account_id or not api_token:
+        raise Exception("Cloudflare API configuration missing")
+
     url = cloudflare_url(TEXT_TO_IMAGE_MODEL)
 
     headers = {
-        "Authorization": f"Bearer {CF_API_TOKEN}",
+        "Authorization": f"Bearer {api_token}",
         "Content-Type": "application/json",
     }
 
@@ -103,7 +415,7 @@ async def create_image(prompt: str) -> bytes:
         response = await client.post(
             url,
             headers=headers,
-            json=data,
+            json=data
         )
 
     response.raise_for_status()
@@ -113,34 +425,33 @@ async def create_image(prompt: str) -> bytes:
     if not result.get("success"):
         raise Exception(result.get("errors"))
 
-    image = result["result"]["image"]
-
-    return base64.b64decode(image)
+    return decode_image_result(result)
 
 
-# =========================
-# Image To Image
-# =========================
+# =========================================================
+# IMAGE TO IMAGE
+# =========================================================
 
-async def transform_image(
-    image_bytes: bytes,
-    prompt: str,
-    strength: float = 0.65,
-) -> bytes:
+async def transform_image(image_bytes, prompt):
+    account_id = get_cf_account_id()
+    api_token = get_cf_api_token()
+
+    if not account_id or not api_token:
+        raise Exception("Cloudflare API configuration missing")
 
     url = cloudflare_url(IMAGE_TO_IMAGE_MODEL)
 
-    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+    image_b64 = base64.b64encode(image_bytes).decode()
 
     headers = {
-        "Authorization": f"Bearer {CF_API_TOKEN}",
+        "Authorization": f"Bearer {api_token}",
         "Content-Type": "application/json",
     }
 
     data = {
         "prompt": prompt,
         "image_b64": image_b64,
-        "strength": strength,
+        "strength": 0.65,
         "num_steps": 20,
         "guidance": 7.5,
     }
@@ -149,7 +460,7 @@ async def transform_image(
         response = await client.post(
             url,
             headers=headers,
-            json=data,
+            json=data
         )
 
     response.raise_for_status()
@@ -159,40 +470,25 @@ async def transform_image(
     if not result.get("success"):
         raise Exception(result.get("errors"))
 
-    output = result.get("result")
-
-    if not output:
-        raise Exception("Cloudflare returned an empty result")
-
-    # Cloudflare image response
-    if isinstance(output, dict):
-        image = output.get("image")
-
-        if image:
-            return base64.b64decode(image)
-
-    # Fallback
-    if isinstance(output, str):
-        try:
-            return base64.b64decode(output)
-        except Exception:
-            pass
-
-    raise Exception("Invalid image response from Cloudflare")
+    return decode_image_result(result)
 
 
-# =========================
-# Handle Photo
-# =========================
+# =========================================================
+# PHOTO HANDLER
+# =========================================================
 
-async def handle_photo(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def handle_photo(update, context):
+    user = update.effective_user
+
+    register_user(user)
+
+    if not await require_join(update, context):
+        return
+
     if not context.user_data.get("waiting_image"):
         await update.message.reply_text(
-            "برای شروع، از منوی پایین یکی از گزینه‌ها را انتخاب کن.",
-            reply_markup=main_keyboard()
+            "برای شروع گزینه «🧠 تبدیل پرامپت به عکس» را انتخاب کن.",
+            reply_markup=main_keyboard(user.id)
         )
         return
 
@@ -221,23 +517,531 @@ async def handle_photo(
 
         await update.message.reply_text(
             "❌ دریافت عکس انجام نشد.\n"
-            "لطفاً دوباره عکس را ارسال کن."
+            "لطفاً دوباره امتحان کن."
         )
 
 
-# =========================
-# Main Message Handler
-# =========================
+# =========================================================
+# ADMIN PANEL
+# =========================================================
 
-async def message_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def admin_panel(update, context):
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    context.user_data.clear()
+
+    await update.message.reply_text(
+        "👑 پنل مدیریت ByteImage\n\n"
+        "یکی از گزینه‌های زیر را انتخاب کن.",
+        reply_markup=admin_keyboard()
+    )
+
+
+async def show_users(update, context):
+    conn = db()
+
+    rows = conn.execute("""
+        SELECT user_id, username, first_name, blocked, last_seen
+        FROM users
+        ORDER BY last_seen DESC
+        LIMIT 30
+    """).fetchall()
+
+    total = conn.execute(
+        "SELECT COUNT(*) AS c FROM users"
+    ).fetchone()["c"]
+
+    conn.close()
+
+    if not rows:
+        await update.message.reply_text(
+            "👥 هنوز کاربری ثبت نشده.",
+            reply_markup=admin_keyboard()
+        )
+        return
+
+    text = f"👥 کاربران\n\nتعداد کل: {total}\n\n"
+
+    for i, row in enumerate(rows, 1):
+        name = row["first_name"] or "-"
+        username = (
+            f"@{row['username']}"
+            if row["username"]
+            else "-"
+        )
+
+        status = "🚫" if row["blocked"] else "🟢"
+
+        text += (
+            f"{i}. {status} {name}\n"
+            f"🆔 {row['user_id']}\n"
+            f"👤 {username}\n"
+            f"🕐 {row['last_seen']}\n\n"
+        )
+
+    await update.message.reply_text(
+        text,
+        reply_markup=admin_keyboard()
+    )
+
+
+async def show_requests(update, context):
+    conn = db()
+
+    rows = conn.execute("""
+        SELECT *
+        FROM requests
+        ORDER BY id DESC
+        LIMIT 20
+    """).fetchall()
+
+    conn.close()
+
+    if not rows:
+        await update.message.reply_text(
+            "📜 هنوز درخواستی ثبت نشده.",
+            reply_markup=admin_keyboard()
+        )
+        return
+
+    for row in rows:
+        name = row["first_name"] or "-"
+        username = (
+            f"@{row['username']}"
+            if row["username"]
+            else "-"
+        )
+
+        await update.message.reply_text(
+            f"👤 {name}\n"
+            f"👤 {username}\n"
+            f"🆔 {row['user_id']}\n"
+            f"📝 {row['prompt']}\n"
+            f"🕐 {row['created_at']}\n"
+            f"🔹 نوع: {row['request_type']}"
+        )
+
+    await update.message.reply_text(
+        "👑 پنل مدیریت",
+        reply_markup=admin_keyboard()
+    )
+
+
+async def show_stats(update, context):
+    conn = db()
+
+    users = conn.execute(
+        "SELECT COUNT(*) AS c FROM users"
+    ).fetchone()["c"]
+
+    requests = conn.execute(
+        "SELECT COUNT(*) AS c FROM requests"
+    ).fetchone()["c"]
+
+    images = conn.execute("""
+        SELECT COUNT(*) AS c
+        FROM requests
+        WHERE request_type = 'text_to_image'
+    """).fetchone()["c"]
+
+    edits = conn.execute("""
+        SELECT COUNT(*) AS c
+        FROM requests
+        WHERE request_type = 'image_to_image'
+    """).fetchone()["c"]
+
+    blocked = conn.execute("""
+        SELECT COUNT(*) AS c
+        FROM users
+        WHERE blocked = 1
+    """).fetchone()["c"]
+
+    conn.close()
+
+    await update.message.reply_text(
+        "📊 آمار کلی\n\n"
+        f"👥 کاربران: {users}\n"
+        f"📜 کل درخواست‌ها: {requests}\n"
+        f"🎨 ساخت تصویر: {images}\n"
+        f"🧠 تبدیل عکس: {edits}\n"
+        f"🚫 کاربران مسدود: {blocked}",
+        reply_markup=admin_keyboard()
+    )
+
+
+async def show_today_usage(update, context):
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    conn = db()
+
+    total = conn.execute("""
+        SELECT COUNT(*) AS c
+        FROM requests
+        WHERE created_at LIKE ?
+    """, (today + "%",)).fetchone()["c"]
+
+    text_images = conn.execute("""
+        SELECT COUNT(*) AS c
+        FROM requests
+        WHERE created_at LIKE ?
+        AND request_type = 'text_to_image'
+    """, (today + "%",)).fetchone()["c"]
+
+    edits = conn.execute("""
+        SELECT COUNT(*) AS c
+        FROM requests
+        WHERE created_at LIKE ?
+        AND request_type = 'image_to_image'
+    """, (today + "%",)).fetchone()["c"]
+
+    conn.close()
+
+    await update.message.reply_text(
+        "📈 مصرف امروز\n\n"
+        f"📊 کل درخواست‌ها: {total}\n"
+        f"🎨 ساخت تصویر: {text_images}\n"
+        f"🧠 تبدیل عکس: {edits}",
+        reply_markup=admin_keyboard()
+    )
+
+
+async def ask_search_user(update, context):
+    context.user_data["admin_search"] = True
+
+    await update.message.reply_text(
+        "🔎 آیدی عددی کاربر را ارسال کن.",
+        reply_markup=admin_keyboard()
+    )
+
+
+async def search_user(update, context, text):
+    try:
+        user_id = int(text)
+    except ValueError:
+        await update.message.reply_text(
+            "❌ آیدی باید عددی باشد.",
+            reply_markup=admin_keyboard()
+        )
+        return
+
+    conn = db()
+
+    user = conn.execute("""
+        SELECT *
+        FROM users
+        WHERE user_id = ?
+    """, (user_id,)).fetchone()
+
+    requests = conn.execute("""
+        SELECT *
+        FROM requests
+        WHERE user_id = ?
+        ORDER BY id DESC
+        LIMIT 10
+    """, (user_id,)).fetchall()
+
+    conn.close()
+
+    if not user:
+        await update.message.reply_text(
+            "❌ کاربر پیدا نشد.",
+            reply_markup=admin_keyboard()
+        )
+        return
+
+    name = user["first_name"] or "-"
+    username = (
+        f"@{user['username']}"
+        if user["username"]
+        else "-"
+    )
+
+    text_out = (
+        f"👤 {name}\n"
+        f"👤 {username}\n"
+        f"🆔 {user['user_id']}\n"
+        f"🚦 وضعیت: "
+        f"{'🚫 مسدود' if user['blocked'] else '🟢 فعال'}\n"
+        f"🕐 آخرین فعالیت: {user['last_seen']}\n\n"
+        f"📜 آخرین درخواست‌ها:\n\n"
+    )
+
+    if requests:
+        for row in requests:
+            text_out += (
+                f"📝 {row['prompt']}\n"
+                f"🕐 {row['created_at']}\n\n"
+            )
+    else:
+        text_out += "هنوز درخواستی ثبت نشده."
+
+    await update.message.reply_text(
+        text_out,
+        reply_markup=admin_keyboard()
+    )
+
+
+async def user_management(update, context):
+    context.user_data["admin_manage"] = True
+
+    await update.message.reply_text(
+        "🚫 مدیریت کاربران\n\n"
+        "برای مسدود کردن یا رفع مسدودی، آیدی عددی کاربر را ارسال کن.",
+        reply_markup=admin_keyboard()
+    )
+
+
+async def manage_user(update, context, text):
+    try:
+        user_id = int(text)
+    except ValueError:
+        await update.message.reply_text(
+            "❌ آیدی باید عددی باشد.",
+            reply_markup=admin_keyboard()
+        )
+        return
+
+    if user_id == ADMIN_ID:
+        await update.message.reply_text(
+            "❌ ادمین اصلی قابل مسدود شدن نیست.",
+            reply_markup=admin_keyboard()
+        )
+        return
+
+    conn = db()
+
+    row = conn.execute("""
+        SELECT blocked
+        FROM users
+        WHERE user_id = ?
+    """, (user_id,)).fetchone()
+
+    if not row:
+        conn.close()
+
+        await update.message.reply_text(
+            "❌ کاربر پیدا نشد.",
+            reply_markup=admin_keyboard()
+        )
+        return
+
+    new_status = 0 if row["blocked"] else 1
+
+    conn.execute("""
+        UPDATE users
+        SET blocked = ?
+        WHERE user_id = ?
+    """, (new_status, user_id))
+
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(
+        (
+            "🚫 کاربر مسدود شد."
+            if new_status
+            else
+            "✅ مسدودی کاربر برداشته شد."
+        ),
+        reply_markup=admin_keyboard()
+    )
+
+
+async def api_panel(update, context):
+    account = get_cf_account_id()
+    token = get_cf_api_token()
+
+    masked = "تنظیم نشده"
+
+    if token:
+        if len(token) > 8:
+            masked = (
+                token[:4]
+                + "••••••••"
+                + token[-4:]
+            )
+        else:
+            masked = "••••••••"
+
+    await update.message.reply_text(
+        "⚙️ مدیریت API\n\n"
+        f"🆔 CF Account ID:\n{account or 'تنظیم نشده'}\n\n"
+        f"🔑 CF API Token:\n{masked}\n\n"
+        "برای تغییر Account ID گزینه مربوطه را انتخاب کن.",
+        reply_markup=ReplyKeyboardMarkup(
+            [
+                ["🆔 تغییر Account ID"],
+                ["🔑 تغییر API Token"],
+                ["🔙 بازگشت"],
+            ],
+            resize_keyboard=True
+        )
+    )
+
+
+# =========================================================
+# ADMIN MESSAGE ROUTER
+# =========================================================
+
+async def admin_message_router(update, context, text):
+    if update.effective_user.id != ADMIN_ID:
+        return False
+
+    if context.user_data.get("admin_search"):
+        context.user_data["admin_search"] = False
+        await search_user(update, context, text)
+        return True
+
+    if context.user_data.get("admin_manage"):
+        context.user_data["admin_manage"] = False
+        await manage_user(update, context, text)
+        return True
+
+    if context.user_data.get("waiting_account_id"):
+        context.user_data["waiting_account_id"] = False
+
+        set_setting("CF_ACCOUNT_ID", text.strip())
+
+        await update.message.reply_text(
+            "✅ CF Account ID ذخیره شد.",
+            reply_markup=admin_keyboard()
+        )
+        return True
+
+    if context.user_data.get("waiting_api_token"):
+        context.user_data["waiting_api_token"] = False
+
+        set_setting("CF_API_TOKEN", text.strip())
+
+        await update.message.reply_text(
+            "✅ CF API Token ذخیره شد.\n\n"
+            "🔐 مقدار Token نمایش داده نمی‌شود.",
+            reply_markup=admin_keyboard()
+        )
+        return True
+
+    if text == "👥 کاربران":
+        await show_users(update, context)
+        return True
+
+    if text == "📜 آخرین درخواست‌ها":
+        await show_requests(update, context)
+        return True
+
+    if text == "🔎 جستجوی کاربر":
+        await ask_search_user(update, context)
+        return True
+
+    if text == "📊 آمار کلی":
+        await show_stats(update, context)
+        return True
+
+    if text == "📈 مصرف امروز":
+        await show_today_usage(update, context)
+        return True
+
+    if text == "🚫 مدیریت کاربران":
+        await user_management(update, context)
+        return True
+
+    if text == "⚙️ مدیریت API":
+        await api_panel(update, context)
+        return True
+
+    if text == "🆔 تغییر Account ID":
+        context.user_data["waiting_account_id"] = True
+
+        await update.message.reply_text(
+            "🆔 CF Account ID جدید را ارسال کن.",
+            reply_markup=admin_keyboard()
+        )
+        return True
+
+    if text == "🔑 تغییر API Token":
+        context.user_data["waiting_api_token"] = True
+
+        await update.message.reply_text(
+            "🔑 CF API Token جدید را ارسال کن.",
+            reply_markup=admin_keyboard()
+        )
+        return True
+
+    return False
+
+
+# =========================================================
+# CALLBACK
+# =========================================================
+
+async def callback_handler(update, context):
+    query = update.callback_query
+
+    await query.answer()
+
+    if query.data != "check_join":
+        return
+
+    user = query.from_user
+
+    register_user(user)
+
+    if await check_membership(user.id, context.bot):
+        await query.edit_message_text(
+            "✅ عضویت شما تأیید شد.\n\n"
+            "حالا می‌تونی از ByteImage استفاده کنی."
+        )
+
+        await context.bot.send_message(
+            chat_id=user.id,
+            text="🎨 منوی اصلی آماده است.",
+            reply_markup=main_keyboard(user.id)
+        )
+
+    else:
+        await query.answer(
+            "❌ هنوز عضو کانال نیستی.",
+            show_alert=True
+        )
+
+
+# =========================================================
+# MAIN MESSAGE HANDLER
+# =========================================================
+
+async def message_handler(update, context):
+    user = update.effective_user
+
+    register_user(user)
+
     text = update.message.text.strip()
 
-    # -------------------------
-    # Image-to-image start
-    # -------------------------
+    # Admin routing
+    if user.id == ADMIN_ID:
+        if await admin_message_router(update, context, text):
+            return
+
+    # Admin panel
+    if text == "👑 پنل مدیریت":
+        await admin_panel(update, context)
+        return
+
+    if text == "🔙 بازگشت":
+        context.user_data.clear()
+
+        await update.message.reply_text(
+            "🏠 منوی اصلی",
+            reply_markup=main_keyboard(user.id)
+        )
+        return
+
+    # All user functionality requires membership
+    if not await require_join(update, context):
+        return
+
+    # -----------------------------------------------------
+    # Image to image
+    # -----------------------------------------------------
 
     if text == "🧠 تبدیل پرامپت به عکس":
         context.user_data.clear()
@@ -248,9 +1052,9 @@ async def message_handler(
         )
         return
 
-    # -------------------------
-    # Text-to-image start
-    # -------------------------
+    # -----------------------------------------------------
+    # Text to image
+    # -----------------------------------------------------
 
     if text == "🎨 ساخت تصویر":
         context.user_data.clear()
@@ -265,9 +1069,9 @@ async def message_handler(
         )
         return
 
-    # -------------------------
+    # -----------------------------------------------------
     # New image
-    # -------------------------
+    # -----------------------------------------------------
 
     if text == "🎨 ساخت تصویر جدید":
         context.user_data.clear()
@@ -278,9 +1082,9 @@ async def message_handler(
         )
         return
 
-    # -------------------------
-    # Repeat last image edit
-    # -------------------------
+    # -----------------------------------------------------
+    # Repeat
+    # -----------------------------------------------------
 
     if text == "🔄 دوباره بساز":
         source_image = context.user_data.get("source_image")
@@ -288,7 +1092,8 @@ async def message_handler(
 
         if not source_image or not last_prompt:
             await update.message.reply_text(
-                "❌ تصویر قبلی برای ساخت مجدد پیدا نشد."
+                "❌ تصویر قبلی برای ساخت مجدد پیدا نشد.",
+                reply_markup=main_keyboard(user.id)
             )
             return
 
@@ -300,14 +1105,19 @@ async def message_handler(
         try:
             image = await transform_image(
                 source_image,
+                last_prompt
+            )
+
+            add_request(
+                user,
                 last_prompt,
-                strength=0.65
+                "image_to_image"
             )
 
             await update.message.reply_photo(
                 photo=image,
                 caption="🧠 تصویر جدید ساخته شد",
-                reply_markup=image_result_keyboard()
+                reply_markup=result_keyboard()
             )
 
             await msg.delete()
@@ -322,9 +1132,9 @@ async def message_handler(
 
         return
 
-    # -------------------------
+    # -----------------------------------------------------
     # Image edit prompt
-    # -------------------------
+    # -----------------------------------------------------
 
     if context.user_data.get("waiting_edit_prompt"):
 
@@ -342,7 +1152,7 @@ async def message_handler(
 
             await update.message.reply_text(
                 "❌ عکس قبلی پیدا نشد.\n"
-                "لطفاً دوباره گزینه «🧠 تبدیل پرامپت به عکس» را انتخاب کن."
+                "دوباره «🧠 تبدیل پرامپت به عکس» را انتخاب کن."
             )
             return
 
@@ -357,14 +1167,19 @@ async def message_handler(
         try:
             image = await transform_image(
                 source_image,
+                text
+            )
+
+            add_request(
+                user,
                 text,
-                strength=0.65
+                "image_to_image"
             )
 
             await update.message.reply_photo(
                 photo=image,
                 caption="🧠 تصویر با موفقیت ساخته شد",
-                reply_markup=image_result_keyboard()
+                reply_markup=result_keyboard()
             )
 
             await msg.delete()
@@ -374,15 +1189,14 @@ async def message_handler(
 
             await msg.edit_text(
                 "❌ تبدیل تصویر انجام نشد.\n\n"
-                "ممکنه سرویس Cloudflare موقتاً خطا داده باشه.\n"
                 "لطفاً دوباره امتحان کن."
             )
 
         return
 
-    # -------------------------
-    # Text-to-image prompt
-    # -------------------------
+    # -----------------------------------------------------
+    # Text image prompt
+    # -----------------------------------------------------
 
     if context.user_data.get("waiting"):
 
@@ -403,10 +1217,16 @@ async def message_handler(
         try:
             image = await create_image(text)
 
+            add_request(
+                user,
+                text,
+                "text_to_image"
+            )
+
             await update.message.reply_photo(
                 photo=image,
                 caption="🎨 تصویر ساخته شد",
-                reply_markup=main_keyboard()
+                reply_markup=result_keyboard()
             )
 
             await msg.delete()
@@ -421,29 +1241,27 @@ async def message_handler(
 
         return
 
-    # -------------------------
-    # Default
-    # -------------------------
-
     await update.message.reply_text(
         "برای شروع یکی از گزینه‌های منوی پایین را انتخاب کن.",
-        reply_markup=main_keyboard()
+        reply_markup=main_keyboard(user.id)
     )
 
 
-# =========================
-# Main
-# =========================
+# =========================================================
+# MAIN
+# =========================================================
 
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN تنظیم نشده")
 
-    if not CF_ACCOUNT_ID:
-        raise RuntimeError("CF_ACCOUNT_ID تنظیم نشده")
+    if not ENV_CF_ACCOUNT_ID:
+        print("⚠️ CF_ACCOUNT_ID از Railway تنظیم نشده؛ ممکن است از پنل تنظیم شود.")
 
-    if not CF_API_TOKEN:
-        raise RuntimeError("CF_API_TOKEN تنظیم نشده")
+    if not ENV_CF_API_TOKEN:
+        print("⚠️ CF_API_TOKEN از Railway تنظیم نشده؛ ممکن است از پنل تنظیم شود.")
+
+    init_db()
 
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -457,13 +1275,22 @@ def main():
     )
 
     app.add_handler(
+        __import__(
+            "telegram.ext",
+            fromlist=["CallbackQueryHandler"]
+        ).CallbackQueryHandler(
+            callback_handler
+        )
+    )
+
+    app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             message_handler
         )
     )
 
-    print("🤖 ByteImageBot is running...")
+    print("🤖 ByteImageBot FULL VERSION is running...")
 
     app.run_polling()
 
