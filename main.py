@@ -441,7 +441,7 @@ async def transform_image(image_bytes, prompt):
 
     url = cloudflare_url(IMAGE_TO_IMAGE_MODEL)
 
-    image_b64 = base64.b64encode(image_bytes).decode()
+    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
 
     headers = {
         "Authorization": f"Bearer {api_token}",
@@ -463,14 +463,66 @@ async def transform_image(image_bytes, prompt):
             json=data
         )
 
-    response.raise_for_status()
+    if response.status_code >= 400:
+        try:
+            error_data = response.json()
+        except Exception:
+            error_data = response.text
 
-    result = response.json()
+        raise Exception(
+            f"Cloudflare HTTP {response.status_code}: {error_data}"
+        )
+
+    content_type = (
+        response.headers.get("content-type", "")
+        .lower()
+    )
+
+    # Cloudflare may return the generated image directly.
+    if content_type.startswith("image/"):
+        image = response.content
+
+        if image:
+            return image
+
+        raise Exception("Cloudflare returned an empty image")
+
+    # Or return the normal JSON API envelope.
+    try:
+        result = response.json()
+    except Exception:
+        raise Exception(
+            "Cloudflare returned an unknown response format"
+        )
 
     if not result.get("success"):
-        raise Exception(result.get("errors"))
+        raise Exception(
+            result.get("errors") or result
+        )
 
-    return decode_image_result(result)
+    output = result.get("result")
+
+    if isinstance(output, dict):
+        image = output.get("image")
+
+        if isinstance(image, str):
+            return base64.b64decode(image)
+
+        if isinstance(image, list):
+            return bytes(image)
+
+    if isinstance(output, str):
+        try:
+            return base64.b64decode(output)
+        except Exception:
+            pass
+
+    if isinstance(output, list):
+        return bytes(output)
+
+    raise Exception(
+        f"Invalid Cloudflare image response: {result}"
+    )
 
 
 # =========================================================
