@@ -1191,7 +1191,7 @@ def main():
 
     async def post_init(application):
         application.create_task(
-            bot_clock_task(application.bot)
+            bot_name_rotation_task(application.bot)
         )
 
     app = (
