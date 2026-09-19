@@ -1,7 +1,9 @@
 import os
+import asyncio
 import base64
 import sqlite3
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import httpx
 from telegram import (
@@ -30,9 +32,47 @@ IMAGE_MODEL = "@cf/black-forest-labs/flux-1-schnell"
 PROMPT_MODEL = "@cf/meta/llama-3.2-3b-instruct"
 
 DB_FILE = "byteimage.db"
+BOT_TIMEZONE = os.getenv("BOT_TIMEZONE", "Asia/Tehran")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
+
+
+# =========================
+# BOT CLOCK NAME
+# =========================
+
+async def bot_clock_task(bot):
+    try:
+        tz = ZoneInfo(BOT_TIMEZONE)
+    except Exception:
+        tz = timezone.utc
+
+    last_name = None
+
+    while True:
+        try:
+            current = datetime.now(tz)
+            bot_name = f"ByteImage • {current:%H:%M}"
+
+            if bot_name != last_name:
+                await bot.set_my_name(name=bot_name)
+                last_name = bot_name
+                print(f"Bot name updated: {bot_name}")
+
+            # Wait until the next minute boundary
+            now_local = datetime.now(tz)
+            delay = 60 - now_local.second - (
+                now_local.microsecond / 1_000_000
+            )
+            await asyncio.sleep(max(1, delay))
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception as e:
+            print("BOT NAME UPDATE ERROR:", repr(e))
+            await asyncio.sleep(60)
 
 
 # =========================
@@ -1145,7 +1185,17 @@ async def error_handler(update, context):
 def main():
     init_db()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    async def post_init(application):
+        application.create_task(
+            bot_clock_task(application.bot)
+        )
+
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
     app.add_handler(
         CommandHandler("start", start)
