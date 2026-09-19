@@ -3,7 +3,6 @@ import asyncio
 import base64
 import sqlite3
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
 
 import httpx
 from telegram import (
@@ -31,8 +30,49 @@ CHANNEL_USERNAME = "@ByteTunnel"
 IMAGE_MODEL = "@cf/black-forest-labs/flux-1-schnell"
 PROMPT_MODEL = "@cf/meta/llama-3.2-3b-instruct"
 
+BOT_NAME_BASE = "𝗣𝗵𝗼𝘁𝗼 𝗰𝗿𝗲𝗮𝘁𝗼𝗿"
+
+BOT_NAME_EMOJIS = [
+    "🌀", "❄️", "🌬️", "🌊", "🏖️", "🏝️", "🌋",
+    "⛄", "🏔️", "🌡️", "⛰️", "🌨️", "☁️", "🌈",
+    "⚡", "🌪️", "☔", "⛈️", "🌞", "⭐", "🌛",
+    "🌚", "🌝", "🪐", "🌑", "🕳️",
+]
+
+
+async def bot_name_rotation_task(bot):
+    index = 0
+
+    while True:
+        try:
+            emoji = BOT_NAME_EMOJIS[index]
+            bot_name = f"{BOT_NAME_BASE} {emoji}"
+
+            try:
+                result = await bot.set_my_name(name=bot_name)
+
+                if result:
+                    print(f"✅ Bot name updated: {bot_name}")
+                else:
+                    print(f"⚠️ Telegram rejected name: {bot_name}")
+
+            except Exception as e:
+                print("⚠️ BOT NAME UPDATE ERROR:", repr(e))
+
+            index = (index + 1) % len(BOT_NAME_EMOJIS)
+
+            # هر ۱۰ دقیقه
+            await asyncio.sleep(600)
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception as e:
+            print("⚠️ BOT NAME ROTATION ERROR:", repr(e))
+            await asyncio.sleep(60)
+
+
 DB_FILE = "byteimage.db"
-BOT_TIMEZONE = os.getenv("BOT_TIMEZONE", "Asia/Tehran")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -42,61 +82,6 @@ if not BOT_TOKEN:
 # BOT CLOCK NAME
 # =========================
 
-async def bot_clock_task(bot):
-    try:
-        tz = ZoneInfo(BOT_TIMEZONE)
-    except Exception:
-        tz = timezone.utc
-
-    last_name = None
-
-    while True:
-        try:
-            current = datetime.now(tz)
-            bot_name = f"ByteImage • {current:%H:%M}"
-
-            if bot_name != last_name:
-                try:
-                    result = await bot.set_my_name(
-                        name=bot_name
-                    )
-
-                    if result:
-                        last_name = bot_name
-                        print(f"✅ Bot name updated: {bot_name}")
-                    else:
-                        print(f"⚠️ Telegram rejected name update: {bot_name}")
-
-                except Exception as e:
-                    print(
-                        "⚠️ BOT NAME UPDATE ERROR:",
-                        repr(e)
-                    )
-
-            # دقیقاً تا شروع دقیقه بعد صبر می‌کنیم
-            now_local = datetime.now(tz)
-            delay = (
-                60
-                - now_local.second
-                - (now_local.microsecond / 1_000_000)
-            )
-
-            await asyncio.sleep(max(2, delay))
-
-        except asyncio.CancelledError:
-            raise
-
-        except Exception as e:
-            print(
-                "⚠️ BOT CLOCK LOOP ERROR:",
-                repr(e)
-            )
-            await asyncio.sleep(10)
-
-
-# =========================
-# DATABASE
-# =========================
 
 def db():
     conn = sqlite3.connect(DB_FILE)
