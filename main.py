@@ -56,23 +56,42 @@ async def bot_clock_task(bot):
             bot_name = f"ByteImage • {current:%H:%M}"
 
             if bot_name != last_name:
-                await bot.set_my_name(name=bot_name)
-                last_name = bot_name
-                print(f"Bot name updated: {bot_name}")
+                try:
+                    result = await bot.set_my_name(
+                        name=bot_name
+                    )
 
-            # Wait until the next minute boundary
+                    if result:
+                        last_name = bot_name
+                        print(f"✅ Bot name updated: {bot_name}")
+                    else:
+                        print(f"⚠️ Telegram rejected name update: {bot_name}")
+
+                except Exception as e:
+                    print(
+                        "⚠️ BOT NAME UPDATE ERROR:",
+                        repr(e)
+                    )
+
+            # دقیقاً تا شروع دقیقه بعد صبر می‌کنیم
             now_local = datetime.now(tz)
-            delay = 60 - now_local.second - (
-                now_local.microsecond / 1_000_000
+            delay = (
+                60
+                - now_local.second
+                - (now_local.microsecond / 1_000_000)
             )
-            await asyncio.sleep(max(1, delay))
+
+            await asyncio.sleep(max(2, delay))
 
         except asyncio.CancelledError:
             raise
 
         except Exception as e:
-            print("BOT NAME UPDATE ERROR:", repr(e))
-            await asyncio.sleep(60)
+            print(
+                "⚠️ BOT CLOCK LOOP ERROR:",
+                repr(e)
+            )
+            await asyncio.sleep(10)
 
 
 # =========================
