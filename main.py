@@ -52,9 +52,9 @@ async def bot_name_rotation_task(bot):
                 result = await bot.set_my_name(name=bot_name)
 
                 if result:
-                    print(f"✅ Bot name updated: {bot_name}")
+                    print(f"✅ BOT NAME UPDATED: {bot_name}")
                 else:
-                    print(f"⚠️ Telegram rejected name: {bot_name}")
+                    print(f"⚠️ TELEGRAM REJECTED BOT NAME: {bot_name}")
 
             except Exception as e:
                 print("⚠️ BOT NAME UPDATE ERROR:", repr(e))
